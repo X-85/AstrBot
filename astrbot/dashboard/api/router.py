@@ -12,6 +12,7 @@ from .chat import router as chat_router
 from .chat_projects import router as chat_projects_router
 from .config_profiles import router as config_profiles_router
 from .conversations import router as conversations_router
+from .dingtalk_feedback import router as dingtalk_feedback_router
 from .cron import router as cron_router
 from .extensions import router as extensions_router
 from .files import router as files_router
@@ -47,6 +48,7 @@ def build_api_router() -> APIRouter:
         chat_router,
         chat_projects_router,
         conversations_router,
+        dingtalk_feedback_router,
         cron_router,
         files_router,
         knowledge_bases_router,

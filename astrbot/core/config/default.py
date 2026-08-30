@@ -430,6 +430,15 @@ CONFIG_METADATA_2 = {
                         "client_secret": "",
                         "card_template_id": "",
                     },
+                    "钉钉反馈增强适配器": {
+                        "id": "dingtalk_feedback",
+                        "type": "dingtalk_feedback",
+                        "enable": True,
+                        "client_id": "",
+                        "client_secret": "",
+                        "feedback_mode": "text",
+                        "card_template_id": "",
+                    },
                     "微信公众平台": {
                         "id": "weixin_official_account",
                         "type": "weixin_official_account",

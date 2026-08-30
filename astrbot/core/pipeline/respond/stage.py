@@ -141,6 +141,7 @@ class RespondStage(Stage):
             "qq_official_webhook",
             "weixin_official_account",
             "dingtalk",
+            "dingtalk_feedback",
         ]:
             return False
 
@@ -309,6 +310,11 @@ class RespondStage(Stage):
                             exc_info=True,
                         )
                 chain = result.derive(result.chain)
+                if (
+                    event.get_platform_name() == "dingtalk_feedback"
+                    and result.is_model_result()
+                ):
+                    chain.type = "dingtalk_feedback_final"
                 if result.chain and len(result.chain) > 0:
                     try:
                         await event.send(chain)

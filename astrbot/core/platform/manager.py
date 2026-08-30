@@ -131,6 +131,20 @@ class PlatformManager:
                 platform_config["type"],
                 platform_config["id"],
             )
+            if platform_config["type"] in {"dingtalk", "dingtalk_feedback"}:
+                client_id = str(platform_config.get("client_id") or "")
+                if client_id and any(
+                    item.get("enable")
+                    and item.get("type") in {"dingtalk", "dingtalk_feedback"}
+                    and item.get("id") != platform_config.get("id")
+                    and str(item.get("client_id") or "") == client_id
+                    for item in self.platforms_config
+                ):
+                    logger.error(
+                        "DingTalk official and feedback adapters cannot share an enabled client_id. "
+                        "Disable one adapter before starting the other."
+                    )
+                    return
             match platform_config["type"]:
                 case "aiocqhttp":
                     from .sources.aiocqhttp.aiocqhttp_platform_adapter import (
@@ -151,6 +165,10 @@ class PlatformManager:
                 case "dingtalk":
                     from .sources.dingtalk.dingtalk_adapter import (
                         DingtalkPlatformAdapter,  # noqa: F401
+                    )
+                case "dingtalk_feedback":
+                    from .sources.dingtalk_feedback.dingtalk_feedback_adapter import (
+                        DingTalkFeedbackPlatformAdapter,  # noqa: F401
                     )
                 case "telegram":
                     from .sources.telegram.tg_adapter import (

@@ -1,0 +1,1 @@
+"""DingTalk feedback adapter package."""

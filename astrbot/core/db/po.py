@@ -554,6 +554,59 @@ class CommandConflict(TimestampMixin, SQLModel, table=True):
     )
 
 
+class DingTalkFeedbackResponse(TimestampMixin, SQLModel, table=True):
+    """An AI response eligible for DingTalk feedback."""
+
+    __tablename__ = "dingtalk_feedback_responses"
+
+    response_id: str = Field(primary_key=True, max_length=36)
+    platform_id: str = Field(nullable=False, index=True, max_length=255)
+    session_id: str = Field(nullable=False, index=True, max_length=512)
+    requester_id: str = Field(nullable=False, index=True, max_length=255)
+    requester_name: str = Field(default="", max_length=255)
+    question: str = Field(nullable=False, sa_type=Text)
+    answer: str = Field(nullable=False, sa_type=Text)
+    mode: str = Field(nullable=False, max_length=32)
+    is_test: bool = Field(default=False, nullable=False, index=True)
+    card_sent: bool = Field(default=False, nullable=False)
+    card_callback_received: bool = Field(default=False, nullable=False)
+    card_error: str | None = Field(default=None, sa_type=Text)
+
+
+class DingTalkFeedbackVote(TimestampMixin, SQLModel, table=True):
+    """The current vote of one employee for one response."""
+
+    __tablename__ = "dingtalk_feedback_votes"
+
+    id: int | None = Field(
+        default=None,
+        primary_key=True,
+        sa_column_kwargs={"autoincrement": True},
+    )
+    response_id: str = Field(nullable=False, index=True, max_length=36)
+    voter_id: str = Field(nullable=False, max_length=255)
+    voter_name: str = Field(default="", max_length=255)
+    value: str = Field(nullable=False, max_length=16)
+
+    __table_args__ = (
+        UniqueConstraint("response_id", "voter_id", name="uix_feedback_vote"),
+    )
+
+
+class DingTalkFeedbackVoteEvent(SQLModel, table=True):
+    """An immutable feedback action used for audit and duplicate suppression."""
+
+    __tablename__ = "dingtalk_feedback_vote_events"
+
+    event_id: str = Field(primary_key=True, max_length=255)
+    response_id: str = Field(nullable=False, index=True, max_length=36)
+    voter_id: str = Field(nullable=False, max_length=255)
+    voter_name: str = Field(default="", max_length=255)
+    value: str = Field(nullable=False, max_length=16)
+    source: str = Field(nullable=False, max_length=32)
+    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+
+
 @dataclass
 class Conversation:
     """LLM 对话类

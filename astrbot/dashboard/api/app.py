@@ -26,6 +26,9 @@ from astrbot.dashboard.services.config_service import (
     ProviderConfigService,
 )
 from astrbot.dashboard.services.conversation_service import ConversationService
+from astrbot.dashboard.services.dingtalk_feedback_service import (
+    DingTalkFeedbackDashboardService,
+)
 from astrbot.dashboard.services.cron_service import CronService
 from astrbot.dashboard.services.file_service import FileService
 from astrbot.dashboard.services.knowledge_base_service import KnowledgeBaseService
@@ -112,6 +115,7 @@ def create_dashboard_asgi_app(
         chat_projects=ChatUIProjectService(db),
         commands=CommandService(core_lifecycle.astrbot_config, core_lifecycle),
         conversations=ConversationService(db, core_lifecycle),
+        dingtalk_feedback=DingTalkFeedbackDashboardService(db, core_lifecycle),
         cron=CronService(core_lifecycle),
         files=FileService(),
         knowledge_bases=KnowledgeBaseService(core_lifecycle),
