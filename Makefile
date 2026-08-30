@@ -1,4 +1,4 @@
-.PHONY: worktree worktree-add worktree-rm pr-test-neo pr-test-full pr-test-full-fast update-test-sandbox
+.PHONY: worktree worktree-add worktree-rm pr-test-neo pr-test-full pr-test-full-fast update-test-sandbox test-plugins
 
 WORKTREE_DIR ?= ../astrbot_worktree
 BRANCH ?= $(word 2,$(MAKECMDGOALS))
@@ -35,6 +35,9 @@ pr-test-full:
 
 pr-test-full-fast:
 	./scripts/pr_test_env.sh --profile full --skip-sync --no-dashboard
+
+test-plugins:
+	uv run pytest data/plugins -q
 
 clean-temp-deployment:
 	@set -eu; \
