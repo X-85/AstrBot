@@ -65,3 +65,6 @@ GenieData/
 .worktrees/
 
 dashboard/bun.lock
+
+# Local container-backup dir created by replace.sh (never commit)
+deploy/astrbot-bak/
