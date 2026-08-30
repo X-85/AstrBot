@@ -289,6 +289,7 @@ async def _apply_kb(
                 query=req.prompt,
                 umo=event.unified_msg_origin,
                 context=plugin_context,
+                event=event,
             )
             if not kb_result:
                 return

@@ -6,6 +6,7 @@ from astrbot.core.agent.run_context import ContextWrapper
 from astrbot.core.agent.tool import FunctionTool, ToolExecResult
 from astrbot.core.astr_agent_context import AstrAgentContext
 from astrbot.core.knowledge_base.kb_helper import KBHelper
+from astrbot.core.observability import emit_message_trace
 from astrbot.core.star.context import Context
 from astrbot.core.tools.registry import builtin_tool
 
@@ -25,6 +26,7 @@ async def retrieve_knowledge_base(
     query: str,
     umo: str,
     context: Context,
+    event=None,
 ) -> str | None:
     """Retrieve knowledge base context for the given query."""
     kb_mgr = context.kb_manager
@@ -53,6 +55,16 @@ async def retrieve_knowledge_base(
                 f"[知识库] 会话 {umo} 配置的以下知识库无效: {invalid_kb_ids}",
             )
         if not kb_names:
+            await emit_message_trace(
+                event,
+                "rag_results",
+                {
+                    "query": query,
+                    "results": [],
+                    "result_count": 0,
+                    "reason": "invalid_kb",
+                },
+            )
             return None
         logger.debug(f"[知识库] 使用会话级配置，知识库数量: {len(kb_names)}")
     else:
@@ -61,12 +73,33 @@ async def retrieve_knowledge_base(
         logger.debug(f"[知识库] 使用全局配置，知识库数量: {len(kb_names)}")
 
     top_k_fusion = config.get("kb_fusion_top_k", 20)
+    await emit_message_trace(
+        event,
+        "rag_request",
+        {
+            "query": query,
+            "kb_names": kb_names,
+            "top_k": top_k,
+            "top_k_fusion": top_k_fusion,
+            "mode": "non_agentic",
+        },
+    )
     if not kb_names:
+        await emit_message_trace(
+            event,
+            "rag_results",
+            {"query": query, "results": [], "result_count": 0, "reason": "no_kb"},
+        )
         return None
 
     all_kbs = [await kb_mgr.get_kb_by_name(kb) for kb in kb_names]
     if check_all_kb(all_kbs):
         logger.debug("所配置的所有知识库全为空，跳过检索过程")
+        await emit_message_trace(
+            event,
+            "rag_results",
+            {"query": query, "results": [], "result_count": 0, "reason": "empty_kb"},
+        )
         return None
 
     logger.debug(f"[知识库] 开始检索知识库，数量: {len(kb_names)}, top_k={top_k}")
@@ -77,13 +110,33 @@ async def retrieve_knowledge_base(
         top_m_final=top_k,
     )
     if not kb_context:
+        await emit_message_trace(
+            event,
+            "rag_results",
+            {"query": query, "results": [], "result_count": 0},
+        )
         return None
 
     formatted = kb_context.get("context_text", "")
     if formatted:
         results = kb_context.get("results", [])
+        await emit_message_trace(
+            event,
+            "rag_results",
+            {
+                "query": query,
+                "results": results,
+                "injected_context": formatted,
+                "result_count": len(results),
+            },
+        )
         logger.debug(f"[知识库] 为会话 {umo} 注入了 {len(results)} 条相关知识块")
         return formatted
+    await emit_message_trace(
+        event,
+        "rag_results",
+        {"query": query, "results": [], "result_count": 0},
+    )
     return None
 
 
@@ -120,6 +173,7 @@ class KnowledgeBaseQueryTool(FunctionTool[AstrAgentContext]):
             query=query,
             umo=context.context.event.unified_msg_origin,
             context=context.context.context,
+            event=context.context.event,
         )
         if not result:
             return "No relevant knowledge found."

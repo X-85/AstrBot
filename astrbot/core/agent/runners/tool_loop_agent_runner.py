@@ -33,6 +33,7 @@ from astrbot.core.message.components import Json
 from astrbot.core.message.message_event_result import (
     MessageChain,
 )
+from astrbot.core.observability import emit_message_trace
 from astrbot.core.persona_error_reply import (
     extract_persona_custom_error_message_from_event,
 )
@@ -284,6 +285,7 @@ class ToolLoopAgentRunner(BaseAgentRunner[TContext]):
         self._last_tool_name: str | None = None
         self._last_tool_args: dict[str, T.Any] | None = None
         self._same_tool_streak = 0
+        self._trace_step = 0
 
         # These two are used for tool schema mode handling
         # We now have two modes:
@@ -512,6 +514,18 @@ class ToolLoopAgentRunner(BaseAgentRunner[TContext]):
         if include_model:
             # For primary provider we keep explicit model selection if provided.
             payload["model"] = self.req.model
+        await emit_message_trace(
+            getattr(self.run_context.context, "event", None),
+            "llm_request_turn",
+            {
+                "provider_id": self.provider.provider_config.get("id", ""),
+                "model": self.req.model or self.provider.get_model(),
+                "streaming": self.streaming,
+                "contexts": payload["contexts"],
+                "tools": self._func_tool_for_provider(),
+                "session_id": self.req.session_id,
+            },
+        )
         if self.streaming:
             stream = self.provider.text_chat_stream(**payload)
             try:
@@ -522,12 +536,28 @@ class ToolLoopAgentRunner(BaseAgentRunner[TContext]):
                         return
                     if resp is None:
                         return
+                    await emit_message_trace(
+                        getattr(self.run_context.context, "event", None),
+                        "llm_response_chunk" if resp.is_chunk else "llm_response_turn",
+                        {
+                            "provider_id": self.provider.provider_config.get("id", ""),
+                            "response": resp,
+                        },
+                    )
                     yield resp
             finally:
                 await self._close_executor(stream)
         else:
             resp = await self._await_or_stop(self.provider.text_chat(**payload))
             if resp is not None:
+                await emit_message_trace(
+                    getattr(self.run_context.context, "event", None),
+                    "llm_response_turn",
+                    {
+                        "provider_id": self.provider.provider_config.get("id", ""),
+                        "response": resp,
+                    },
+                )
                 yield resp
 
     async def _iter_llm_responses_with_fallback(
@@ -790,6 +820,13 @@ class ToolLoopAgentRunner(BaseAgentRunner[TContext]):
         """
         if not self.req:
             raise ValueError("Request is not set. Please call reset() first.")
+
+        self._trace_step += 1
+        await emit_message_trace(
+            getattr(self.run_context.context, "event", None),
+            "agent_step",
+            {"step": self._trace_step, "state": self._state.value},
+        )
 
         if self._state == AgentState.IDLE:
             try:

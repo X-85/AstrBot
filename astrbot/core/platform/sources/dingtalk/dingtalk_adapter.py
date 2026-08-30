@@ -22,6 +22,7 @@ from astrbot.api.platform import (
     PlatformMetadata,
 )
 from astrbot.core import sp
+from astrbot.core.observability import emit_message_trace
 from astrbot.core.platform.astr_message_event import MessageSesion
 from astrbot.core.utils.astrbot_path import get_astrbot_temp_path
 from astrbot.core.utils.io import download_file
@@ -75,13 +76,26 @@ class DingtalkPlatformAdapter(Platform):
 
         self.client_id = platform_config["client_id"]
         self.client_secret = platform_config["client_secret"]
+        self._message_trace_ids: dict[str, str] = {}
 
         outer_self = self
 
         class AstrCallbackClient(dingtalk_stream.ChatbotHandler):
             async def process(self, message: dingtalk_stream.CallbackMessage):
                 logger.debug(f"dingtalk: {message.data}")
+                trace_id = await emit_message_trace(
+                    None,
+                    "inbound_raw",
+                    {
+                        "platform": "dingtalk",
+                        "platform_id": outer_self.config.get("id", ""),
+                        "raw": message.data,
+                        "headers": getattr(message, "headers", None),
+                    },
+                )
                 im = dingtalk_stream.ChatbotMessage.from_dict(message.data)
+                if im.message_id:
+                    outer_self._message_trace_ids[str(im.message_id)] = trace_id
                 abm = await outer_self.convert_msg(im)
                 await outer_self.handle_msg(abm)
 
@@ -441,6 +455,8 @@ class DingtalkPlatformAdapter(Platform):
         robot_code: str,
         msg_key: str,
         msg_param: dict,
+        trace_id: str | None = None,
+        sender_id: str | None = None,
     ) -> None:
         access_token = await self.get_access_token()
         if not access_token:
@@ -453,6 +469,22 @@ class DingtalkPlatformAdapter(Platform):
             "openConversationId": open_conversation_id,
             "robotCode": robot_code,
         }
+        if trace_id:
+            await emit_message_trace(
+                None,
+                "outbound_dingtalk",
+                {
+                    "platform": "dingtalk",
+                    "platform_id": self.config.get("id", ""),
+                    "target_type": "group",
+                    "target_id": open_conversation_id,
+                    "msg_key": msg_key,
+                    "msg_param": msg_param,
+                    "payload": payload,
+                    "sender_id": sender_id or "",
+                },
+                trace_id=trace_id,
+            )
         headers = {
             "Content-Type": "application/json",
             "x-acs-dingtalk-access-token": access_token,
@@ -463,6 +495,13 @@ class DingtalkPlatformAdapter(Platform):
                 headers=headers,
                 json=payload,
             ) as resp:
+                if trace_id:
+                    await emit_message_trace(
+                        None,
+                        "outbound_dingtalk_result",
+                        {"status": resp.status, "response": await resp.text()},
+                        trace_id=trace_id,
+                    )
                 if resp.status != 200:
                     logger.error(
                         f"钉钉群消息发送失败: {resp.status}, {await resp.text()}",
@@ -474,6 +513,8 @@ class DingtalkPlatformAdapter(Platform):
         robot_code: str,
         msg_key: str,
         msg_param: dict,
+        trace_id: str | None = None,
+        sender_id: str | None = None,
     ) -> None:
         access_token = await self.get_access_token()
         if not access_token:
@@ -486,6 +527,22 @@ class DingtalkPlatformAdapter(Platform):
             "msgKey": msg_key,
             "msgParam": json.dumps(msg_param, ensure_ascii=False),
         }
+        if trace_id:
+            await emit_message_trace(
+                None,
+                "outbound_dingtalk",
+                {
+                    "platform": "dingtalk",
+                    "platform_id": self.config.get("id", ""),
+                    "target_type": "user",
+                    "target_id": staff_id,
+                    "msg_key": msg_key,
+                    "msg_param": msg_param,
+                    "payload": payload,
+                    "sender_id": sender_id or staff_id,
+                },
+                trace_id=trace_id,
+            )
         headers = {
             "Content-Type": "application/json",
             "x-acs-dingtalk-access-token": access_token,
@@ -496,6 +553,13 @@ class DingtalkPlatformAdapter(Platform):
                 headers=headers,
                 json=payload,
             ) as resp:
+                if trace_id:
+                    await emit_message_trace(
+                        None,
+                        "outbound_dingtalk_result",
+                        {"status": resp.status, "response": await resp.text()},
+                        trace_id=trace_id,
+                    )
                 if resp.status != 200:
                     logger.error(
                         f"钉钉私聊消息发送失败: {resp.status}, {await resp.text()}",
@@ -566,6 +630,8 @@ class DingtalkPlatformAdapter(Platform):
         robot_code: str,
         message_chain: MessageChain,
         at_str: str = "",
+        trace_id: str | None = None,
+        sender_id: str | None = None,
     ) -> None:
         async def send_message(msg_key: str, msg_param: dict) -> None:
             if target_type == "group":
@@ -574,6 +640,8 @@ class DingtalkPlatformAdapter(Platform):
                     robot_code=robot_code,
                     msg_key=msg_key,
                     msg_param=msg_param,
+                    trace_id=trace_id,
+                    sender_id=sender_id,
                 )
             else:
                 await self._send_private_message(
@@ -581,6 +649,8 @@ class DingtalkPlatformAdapter(Platform):
                     robot_code=robot_code,
                     msg_key=msg_key,
                     msg_param=msg_param,
+                    trace_id=trace_id,
+                    sender_id=sender_id,
                 )
 
         for segment in message_chain.chain:
@@ -697,6 +767,8 @@ class DingtalkPlatformAdapter(Platform):
         robot_code: str,
         message_chain: MessageChain,
         at_str: str = "",
+        trace_id: str | None = None,
+        sender_id: str | None = None,
     ) -> None:
         await self._send_message_chain(
             target_type="group",
@@ -704,6 +776,8 @@ class DingtalkPlatformAdapter(Platform):
             robot_code=robot_code,
             message_chain=message_chain,
             at_str=at_str,
+            trace_id=trace_id,
+            sender_id=sender_id,
         )
 
     async def send_message_chain_to_user(
@@ -712,6 +786,8 @@ class DingtalkPlatformAdapter(Platform):
         robot_code: str,
         message_chain: MessageChain,
         at_str: str = "",
+        trace_id: str | None = None,
+        sender_id: str | None = None,
     ) -> None:
         await self._send_message_chain(
             target_type="user",
@@ -719,6 +795,8 @@ class DingtalkPlatformAdapter(Platform):
             robot_code=robot_code,
             message_chain=message_chain,
             at_str=at_str,
+            trace_id=trace_id,
+            sender_id=sender_id,
         )
 
     async def send_message_chain_with_incoming(
@@ -727,6 +805,7 @@ class DingtalkPlatformAdapter(Platform):
         message_chain: MessageChain,
     ) -> None:
         robot_code = self.client_id
+        trace_id = self._message_trace_ids.get(str(incoming_message.message_id))
 
         # at_list: list[str] = []
         sender_id = cast(str, incoming_message.sender_id or "")
@@ -749,6 +828,8 @@ class DingtalkPlatformAdapter(Platform):
                 open_conversation_id=cast(str, incoming_message.conversation_id),
                 robot_code=robot_code,
                 message_chain=message_chain,
+                trace_id=trace_id,
+                sender_id=normalized_sender_id,
                 # at_str=at_str,
             )
         else:
@@ -765,6 +846,8 @@ class DingtalkPlatformAdapter(Platform):
                 staff_id=staff_id,
                 robot_code=robot_code,
                 message_chain=message_chain,
+                trace_id=trace_id,
+                sender_id=normalized_sender_id,
                 # at_str=at_str,
             )
 
@@ -787,7 +870,24 @@ class DingtalkPlatformAdapter(Platform):
         )
 
     async def handle_msg(self, abm: AstrBotMessage) -> None:
-        self.commit_event(self.create_event(abm))
+        event = self.create_event(abm)
+        trace_id = self._message_trace_ids.get(str(abm.message_id))
+        if trace_id:
+            event.set_extra("message_trace_id", trace_id)
+        await emit_message_trace(
+            event,
+            "inbound_normalized",
+            {
+                "message_str": abm.message_str,
+                "message": abm.message,
+                "message_id": abm.message_id,
+                "message_type": str(abm.type),
+                "sender_id": abm.sender.user_id,
+                "sender_name": abm.sender.nickname,
+                "session_id": abm.session_id,
+            },
+        )
+        self.commit_event(event)
 
     async def run(self) -> None:
         # await self.client_.start()
