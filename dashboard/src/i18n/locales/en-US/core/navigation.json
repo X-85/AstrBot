@@ -22,6 +22,7 @@
   "sessionManagement": "Custom Rules",
   "console": "Console",
   "trace": "Trace",
+  "dingtalkFeedback": "DingTalk Feedback",
   "alkaid": "Alkaid Lab",
   "knowledgeBase": "Knowledge Base",
   "about": "About",

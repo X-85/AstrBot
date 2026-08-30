@@ -95,6 +95,11 @@ const sidebarItem: menu[] = [
         icon: 'mdi-timeline-text-outline',
         to: '/trace'
       },
+      {
+        title: 'core.navigation.dingtalkFeedback',
+        icon: 'mdi-thumb-up-outline',
+        to: '/dingtalk-feedback'
+      },
     ]
   }
   // {

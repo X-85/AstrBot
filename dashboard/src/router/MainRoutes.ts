@@ -187,6 +187,11 @@ const MainRoutes = {
       component: () => import('@/views/TracePage.vue')
     },
     {
+      name: 'DingTalkFeedback',
+      path: '/dingtalk-feedback',
+      component: () => import('@/views/DingTalkFeedbackPage.vue')
+    },
+    {
       name: 'NativeKnowledgeBase',
       path: '/knowledge-base',
       component: () => import('@/views/knowledge-base/index.vue'),
