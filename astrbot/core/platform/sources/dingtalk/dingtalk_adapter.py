@@ -1,5 +1,6 @@
 import asyncio
 import json
+import re
 import threading
 import time
 import uuid
@@ -22,6 +23,7 @@ from astrbot.api.platform import (
     PlatformMetadata,
 )
 from astrbot.core import sp
+from astrbot.core.observability import emit_message_trace
 from astrbot.core.platform.astr_message_event import MessageSesion
 from astrbot.core.utils.astrbot_path import get_astrbot_temp_path
 from astrbot.core.utils.io import download_file
@@ -75,19 +77,151 @@ class DingtalkPlatformAdapter(Platform):
 
         self.client_id = platform_config["client_id"]
         self.client_secret = platform_config["client_secret"]
+        self._message_trace_ids: dict[str, str] = {}
 
         outer_self = self
 
         class AstrCallbackClient(dingtalk_stream.ChatbotHandler):
             async def process(self, message: dingtalk_stream.CallbackMessage):
                 logger.debug(f"dingtalk: {message.data}")
+                trace_id = await emit_message_trace(
+                    None,
+                    "inbound_raw",
+                    {
+                        "platform": "dingtalk",
+                        "platform_id": outer_self.config.get("id", ""),
+                        "raw": message.data,
+                        "headers": getattr(message, "headers", None),
+                    },
+                )
+                # patch: 缓存 sessionWebhook 与发送者信息, 供群消息回推/@ 使用
+                _raw = message.data or {}
+                _cid = _raw.get("conversationId")
+                _swh = _raw.get("sessionWebhook")
+                if _cid and _swh:
+                    outer_self._dt_webhooks[_cid] = _swh
+                _staff = _raw.get("senderStaffId")
+                _nick = _raw.get("senderNick")
+                _sid = _raw.get("senderId")
+                if _cid and (_staff or _nick):
+                    outer_self._dt_senders[_cid] = {
+                        "staff_id": _staff,
+                        "nick": _nick,
+                        "sender_id": _sid,
+                    }
+                # patch: 持久化用户昵称/工号映射(scope=global, scope_id=私聊UMO), 供人员名单/按人配置使用
+                # 已有相同值则不重复写, 首次/变化时才更新, 减少无效写入
+                if _sid:
+                    _sid_clean = str(_sid).replace("$:LWCP_v1:$", "")
+                    if _sid_clean:
+                        try:
+                            _umo = f"dingtalk:FriendMessage:{_sid_clean}"
+                            if _nick:
+                                _cur = sp.get("dingtalk_nick", None, scope="global", scope_id=_umo)
+                                if _cur != _nick:
+                                    await sp.put_async("global", _umo, "dingtalk_nick", _nick)
+                            if _staff:
+                                _cur = sp.get("dingtalk_staffid", None, scope="global", scope_id=_umo)
+                                if _cur != _staff:
+                                    await sp.put_async("global", _umo, "dingtalk_staffid", _staff)
+                            # patch: 群聊消息登记群会话UMO(GroupMessage:<群conversationId>), 供群管控配置使用
+                            if str(_raw.get("conversationType", "")) == "2" and _cid:
+                                _gumo = f"dingtalk:GroupMessage:{_cid}"
+                                _gcur = sp.get("dingtalk_group", None, scope="global", scope_id=_gumo)
+                                if _gcur != _cid:
+                                    await sp.put_async("global", _gumo, "dingtalk_group", _cid)
+                        except Exception as e:
+                            logger.debug(f"持久化钉钉用户信息失败: {e}")
                 im = dingtalk_stream.ChatbotMessage.from_dict(message.data)
+                if im.message_id:
+                    outer_self._message_trace_ids[str(im.message_id)] = trace_id
                 abm = await outer_self.convert_msg(im)
                 await outer_self.handle_msg(abm)
 
                 return AckMessage.STATUS_OK, "OK"
 
         self.client = AstrCallbackClient()
+
+        class AstrCardCallbackClient(dingtalk_stream.CallbackHandler):
+            async def process(self, callback: dingtalk_stream.CallbackMessage):
+                logger.debug(f"dingtalk card callback: {callback.data}")
+                try:
+                    raw = callback.data or {}
+                    card_msg = dingtalk_stream.CardCallbackMessage.from_dict(raw)
+                    # 手动解析 content（SDK from_dict 的 json.loads 对非 JSON 值会抛异常，
+                    # 这里单独兜底避免整条回调丢失）
+                    content: dict[str, Any] = {}
+                    try:
+                        content = json.loads(card_msg.content) if isinstance(card_msg.content, str) else (
+                            card_msg.content if isinstance(card_msg.content, dict) else {}
+                        )
+                    except (TypeError, ValueError, json.JSONDecodeError):
+                        content = {}
+                    # 实测回调 content 结构（低代码卡片按钮）：
+                    # {"cardPrivateData":{"actionIds":["vote_like"],"params":{"card_id":"FAQ-000049"}}}
+                    # action 在 cardPrivateData.actionIds（数组），回传参数在 cardPrivateData.params
+                    card_private = content.get("cardPrivateData") or {}
+                    if not isinstance(card_private, dict):
+                        card_private = {}
+                    params = card_private.get("params") or content.get("params") or {}
+                    if not isinstance(params, dict):
+                        params = {}
+                    action_ids = card_private.get("actionIds") or []
+                    action = str(
+                        (action_ids[0] if action_ids else "")
+                        or card_private.get("actionId")
+                        or params.get("actionId")
+                        or content.get("actionId")
+                        or content.get("action")
+                        or ""
+                    )
+                    card_id = str(params.get("card_id") or content.get("card_id") or "")
+                    # 点击者身份：优先 senderStaffId（工号），否则回退 userId
+                    staff_id = str(
+                        raw.get("senderStaffId")
+                        or raw.get("staffId")
+                        or raw.get("userId")
+                        or card_msg.user_id
+                        or ""
+                    )
+                    # 群卡片回调带 spaceId（可能是 openSpaceId 带前缀，也可能是会话ID）
+                    space_id = str(raw.get("spaceId") or "")
+                    is_group = space_id.startswith("dtv1.card//IM_GROUP.")
+                    for prefix in ("dtv1.card//IM_GROUP.", "dtv1.card//IM_ROBOT."):
+                        if space_id.startswith(prefix):
+                            space_id = space_id[len(prefix) :]
+                            break
+                    conversation_id = space_id
+                    abm = AstrBotMessage()
+                    abm.message = []
+                    abm.message_str = ""
+                    abm.timestamp = int(time.time())
+                    abm.type = "DINGTALK_CARD_CALLBACK"
+                    abm.sender = MessageMember(user_id=staff_id, nickname="")
+                    abm.self_id = ""
+                    abm.message_id = str(
+                        getattr(callback.headers, "message_id", None) or uuid.uuid4()
+                    )
+                    abm.raw_message = {
+                        "action": action,
+                        "card_id": card_id,
+                        "staff_id": staff_id,
+                        "conversation_id": conversation_id,
+                        "is_group": is_group,
+                        # outTrackId 即 createAndDeliver 时生成的卡片实例 ID，
+                        # 供插件调 card/instances/update 刷新卡片数字
+                        "card_instance_id": card_msg.card_instance_id or card_id,
+                        "card_param_map": params,
+                    }
+                    if conversation_id:
+                        abm.group_id = conversation_id
+                    abm.session_id = conversation_id or staff_id
+                    await outer_self.handle_msg(abm)
+                except Exception as e:
+                    logger.error(f"钉钉卡片回调处理异常: {e}")
+                return AckMessage.STATUS_OK, "OK"
+
+        self.card_client = AstrCardCallbackClient()
 
         credential = dingtalk_stream.Credential(self.client_id, self.client_secret)
         client = dingtalk_stream.DingTalkStreamClient(credential, logger=logger)
@@ -96,9 +230,17 @@ class DingtalkPlatformAdapter(Platform):
             dingtalk_stream.ChatbotMessage.TOPIC,
             self.client,
         )
+        client.register_callback_handler(
+            dingtalk_stream.CallbackHandler.TOPIC_CARD_CALLBACK,
+            self.card_client,
+        )
         self.client_ = client  # 用于 websockets 的 client
         self._shutdown_event = threading.Event()
         self._terminated_event = threading.Event()
+
+        # patch: 钉钉会话回推缓存(旧式群机器人走 sessionWebhook)
+        self._dt_webhooks: dict[str, str] = {}
+        self._dt_senders: dict[str, dict] = {}
 
     def _id_to_sid(self, dingtalk_id: str | None) -> str:
         if not dingtalk_id:
@@ -151,6 +293,121 @@ class DingtalkPlatformAdapter(Platform):
     ) -> None:
         # backward typo compatibility
         await self.send_by_session(session, message_chain)
+
+    # ---- patch: 钉钉群消息走 sessionWebhook 回推 + @ 高亮 ----
+    @staticmethod
+    def _dt_norm(s: str) -> str:
+        return re.sub(r"[/+=_]", "", s or "")
+
+    @staticmethod
+    def _dt_is_text_chain(message_chain: "MessageChain") -> bool:
+        has_text = False
+        for seg in message_chain.chain:
+            # 含媒体(图片/语音/视频/文件)走原 API, 其余(文本/@/引用)走 sessionWebhook
+            if isinstance(seg, (Image, Record, Video, File)):
+                return False
+            if isinstance(seg, Plain):
+                has_text = True
+        return has_text
+
+    def _dt_webhook_for(self, cid: str) -> str | None:
+        if not cid:
+            return None
+        w = self._dt_webhooks.get(cid)
+        if w:
+            return w
+        n = self._dt_norm(cid)
+        for k, v in self._dt_webhooks.items():
+            if self._dt_norm(k) == n:
+                return v
+        return None
+
+    def _dt_sender_for(self, cid: str) -> dict | None:
+        if not cid:
+            return None
+        s = self._dt_senders.get(cid)
+        if s:
+            return s
+        n = self._dt_norm(cid)
+        for k, v in self._dt_senders.items():
+            if self._dt_norm(k) == n:
+                return v
+        return None
+
+    async def _send_text_via_webhook(
+        self, webhook: str, open_conversation_id: str, message_chain: MessageChain
+    ) -> bool:
+        texts: list[str] = []
+        at_all = False
+        for seg in message_chain.chain:
+            # 精确跳过 At 段: 避免把 @昵称 文本塞进 markdown 正文造成重复 @
+            if isinstance(seg, At):
+                # AstrBot At 组件约定: qq == "all" 表示 @ 所有人;
+                # 用 isinstance 以便同时识别官方 AtAll 组件(At 的子类)
+                if getattr(seg, "qq", None) == "all":
+                    at_all = True
+                continue
+            if isinstance(seg, Plain):
+                t = seg.text.strip()
+                if t:
+                    texts.append(t)
+        content = "\n".join(texts)
+        # 兜底: 剔除正文里可能残留的 @昵称 行, @ 只由 text 气泡负责(高亮)
+        content = re.sub(r"(?m)^\s*@\S[^\n]*\n?", "", content).strip()
+        sender = self._dt_sender_for(open_conversation_id) or {}
+        staff = sender.get("staff_id")
+        sid = sender.get("sender_id")
+        nick = sender.get("nick") or "someone"
+        # sender_id 可能是带 $:LWCP_v1:$ 前缀的 dingtalkId, 去掉前缀才是标准 userId
+        sid = self._id_to_sid(sid)
+        staff = self._id_to_sid(staff)
+        at_ids = [i for i in (sid, staff) if i]
+        try:
+            async with aiohttp.ClientSession() as session:
+                # 1) @ 单独用 text 类型发送: 钉钉 text 类型 atUserIds 才能高亮,
+                #    markdown 类型不认 atUserIds(只认 atMobiles/atDingtalkIds)
+                if at_all:
+                    # @ 所有人: 钉钉 text 类型 isAtAll=true 触发群内全员提醒
+                    at_all_body = {
+                        "msgtype": "text",
+                        "text": {"content": "🔔 全员提醒"},
+                        "at": {"isAtAll": True},
+                    }
+                    async with session.post(webhook, json=at_all_body) as resp_all:
+                        if resp_all.status != 200:
+                            logger.error(
+                                f"钉钉 sessionWebhook(@所有人) 发送失败: {resp_all.status}, {await resp_all.text()}",
+                            )
+                elif at_ids:
+                    # 实测: content 里写任何 @ 文本(昵称/userId)钉钉都不识别, 只会显示成普通文本,
+                    # 与 at 蓝条叠加成两次。钉钉 text content 又必填(空/纯空格会被拒发),
+                    # 所以只放一个不含 @ 的提醒符号, @ 高亮完全交给 at.atUserIds 蓝条。
+                    at_body = {
+                        "msgtype": "text",
+                        "text": {"content": "🔔"},
+                        "at": {"atUserIds": at_ids, "isAtAll": False},
+                    }
+                    async with session.post(webhook, json=at_body) as resp2:
+                        if resp2.status != 200:
+                            logger.error(
+                                f"钉钉 sessionWebhook(@) 发送失败: {resp2.status}, {await resp2.text()}",
+                            )
+                            # 内容已送达, @ 失败不视为整体失败
+                # 2) 富文本内容用 markdown 类型发送(表格/粗体正常渲染)
+                md_body = {
+                    "msgtype": "markdown",
+                    "markdown": {"title": "AstrBot", "text": content},
+                }
+                async with session.post(webhook, json=md_body) as resp:
+                    if resp.status != 200:
+                        logger.error(
+                            f"钉钉 sessionWebhook(markdown) 发送失败: {resp.status}, {await resp.text()}",
+                        )
+                        return False
+            return True
+        except Exception as e:
+            logger.error(f"钉钉 sessionWebhook 发送异常: {e}")
+            return False
 
     def meta(self) -> PlatformMetadata:
         return PlatformMetadata(
@@ -441,6 +698,8 @@ class DingtalkPlatformAdapter(Platform):
         robot_code: str,
         msg_key: str,
         msg_param: dict,
+        trace_id: str | None = None,
+        sender_id: str | None = None,
     ) -> None:
         access_token = await self.get_access_token()
         if not access_token:
@@ -453,6 +712,22 @@ class DingtalkPlatformAdapter(Platform):
             "openConversationId": open_conversation_id,
             "robotCode": robot_code,
         }
+        if trace_id:
+            await emit_message_trace(
+                None,
+                "outbound_dingtalk",
+                {
+                    "platform": "dingtalk",
+                    "platform_id": self.config.get("id", ""),
+                    "target_type": "group",
+                    "target_id": open_conversation_id,
+                    "msg_key": msg_key,
+                    "msg_param": msg_param,
+                    "payload": payload,
+                    "sender_id": sender_id or "",
+                },
+                trace_id=trace_id,
+            )
         headers = {
             "Content-Type": "application/json",
             "x-acs-dingtalk-access-token": access_token,
@@ -463,6 +738,13 @@ class DingtalkPlatformAdapter(Platform):
                 headers=headers,
                 json=payload,
             ) as resp:
+                if trace_id:
+                    await emit_message_trace(
+                        None,
+                        "outbound_dingtalk_result",
+                        {"status": resp.status, "response": await resp.text()},
+                        trace_id=trace_id,
+                    )
                 if resp.status != 200:
                     logger.error(
                         f"钉钉群消息发送失败: {resp.status}, {await resp.text()}",
@@ -474,6 +756,8 @@ class DingtalkPlatformAdapter(Platform):
         robot_code: str,
         msg_key: str,
         msg_param: dict,
+        trace_id: str | None = None,
+        sender_id: str | None = None,
     ) -> None:
         access_token = await self.get_access_token()
         if not access_token:
@@ -486,6 +770,22 @@ class DingtalkPlatformAdapter(Platform):
             "msgKey": msg_key,
             "msgParam": json.dumps(msg_param, ensure_ascii=False),
         }
+        if trace_id:
+            await emit_message_trace(
+                None,
+                "outbound_dingtalk",
+                {
+                    "platform": "dingtalk",
+                    "platform_id": self.config.get("id", ""),
+                    "target_type": "user",
+                    "target_id": staff_id,
+                    "msg_key": msg_key,
+                    "msg_param": msg_param,
+                    "payload": payload,
+                    "sender_id": sender_id or staff_id,
+                },
+                trace_id=trace_id,
+            )
         headers = {
             "Content-Type": "application/json",
             "x-acs-dingtalk-access-token": access_token,
@@ -496,6 +796,13 @@ class DingtalkPlatformAdapter(Platform):
                 headers=headers,
                 json=payload,
             ) as resp:
+                if trace_id:
+                    await emit_message_trace(
+                        None,
+                        "outbound_dingtalk_result",
+                        {"status": resp.status, "response": await resp.text()},
+                        trace_id=trace_id,
+                    )
                 if resp.status != 200:
                     logger.error(
                         f"钉钉私聊消息发送失败: {resp.status}, {await resp.text()}",
@@ -566,7 +873,16 @@ class DingtalkPlatformAdapter(Platform):
         robot_code: str,
         message_chain: MessageChain,
         at_str: str = "",
+        trace_id: str | None = None,
+        sender_id: str | None = None,
     ) -> None:
+        # patch: 检测 @所有人 组件。官方接口(groupMessages/send)的 sampleText/sampleMarkdown
+        # 支持 atAll 参数，使 sessionWebhook 缓存未命中回退到本路径时 @所有人 仍能生效。
+        has_at_all = any(
+            isinstance(segment, At) and getattr(segment, "qq", None) == "all"
+            for segment in message_chain.chain
+        )
+
         async def send_message(msg_key: str, msg_param: dict) -> None:
             if target_type == "group":
                 await self._send_group_message(
@@ -574,6 +890,8 @@ class DingtalkPlatformAdapter(Platform):
                     robot_code=robot_code,
                     msg_key=msg_key,
                     msg_param=msg_param,
+                    trace_id=trace_id,
+                    sender_id=sender_id,
                 )
             else:
                 await self._send_private_message(
@@ -581,6 +899,8 @@ class DingtalkPlatformAdapter(Platform):
                     robot_code=robot_code,
                     msg_key=msg_key,
                     msg_param=msg_param,
+                    trace_id=trace_id,
+                    sender_id=sender_id,
                 )
 
         for segment in message_chain.chain:
@@ -590,14 +910,20 @@ class DingtalkPlatformAdapter(Platform):
                     continue
                 text = f"{at_str} {text}".strip()
                 if message_chain.use_markdown_ is False:
+                    text_param: dict = {"content": text}
+                    if has_at_all and target_type == "group":
+                        text_param["atAll"] = True
                     await send_message(
                         msg_key="sampleText",
-                        msg_param={"content": text},
+                        msg_param=text_param,
                     )
                 else:
+                    md_param: dict = {"title": "AstrBot", "text": text}
+                    if has_at_all and target_type == "group":
+                        md_param["atAll"] = True
                     await send_message(
                         msg_key="sampleMarkdown",
-                        msg_param={"title": "AstrBot", "text": text},
+                        msg_param=md_param,
                     )
             elif isinstance(segment, Image):
                 photo_url = segment.file or segment.url or ""
@@ -697,13 +1023,23 @@ class DingtalkPlatformAdapter(Platform):
         robot_code: str,
         message_chain: MessageChain,
         at_str: str = "",
+        trace_id: str | None = None,
+        sender_id: str | None = None,
     ) -> None:
+        # patch: 旧式群机器人优先用 sessionWebhook 回推(text 支持 @, 无需 openConversationId)
+        webhook = self._dt_webhook_for(open_conversation_id)
+        if webhook and self._dt_is_text_chain(message_chain):
+            if await self._send_text_via_webhook(webhook, open_conversation_id, message_chain):
+                return
+            logger.warning("钉钉 sessionWebhook 发送失败，回退 groupMessages/send")
         await self._send_message_chain(
             target_type="group",
             target_id=open_conversation_id,
             robot_code=robot_code,
             message_chain=message_chain,
             at_str=at_str,
+            trace_id=trace_id,
+            sender_id=sender_id,
         )
 
     async def send_message_chain_to_user(
@@ -712,6 +1048,8 @@ class DingtalkPlatformAdapter(Platform):
         robot_code: str,
         message_chain: MessageChain,
         at_str: str = "",
+        trace_id: str | None = None,
+        sender_id: str | None = None,
     ) -> None:
         await self._send_message_chain(
             target_type="user",
@@ -719,6 +1057,8 @@ class DingtalkPlatformAdapter(Platform):
             robot_code=robot_code,
             message_chain=message_chain,
             at_str=at_str,
+            trace_id=trace_id,
+            sender_id=sender_id,
         )
 
     async def send_message_chain_with_incoming(
@@ -727,6 +1067,7 @@ class DingtalkPlatformAdapter(Platform):
         message_chain: MessageChain,
     ) -> None:
         robot_code = self.client_id
+        trace_id = self._message_trace_ids.get(str(incoming_message.message_id))
 
         # at_list: list[str] = []
         sender_id = cast(str, incoming_message.sender_id or "")
@@ -749,6 +1090,8 @@ class DingtalkPlatformAdapter(Platform):
                 open_conversation_id=cast(str, incoming_message.conversation_id),
                 robot_code=robot_code,
                 message_chain=message_chain,
+                trace_id=trace_id,
+                sender_id=normalized_sender_id,
                 # at_str=at_str,
             )
         else:
@@ -765,6 +1108,8 @@ class DingtalkPlatformAdapter(Platform):
                 staff_id=staff_id,
                 robot_code=robot_code,
                 message_chain=message_chain,
+                trace_id=trace_id,
+                sender_id=normalized_sender_id,
                 # at_str=at_str,
             )
 
@@ -787,7 +1132,24 @@ class DingtalkPlatformAdapter(Platform):
         )
 
     async def handle_msg(self, abm: AstrBotMessage) -> None:
-        self.commit_event(self.create_event(abm))
+        event = self.create_event(abm)
+        trace_id = self._message_trace_ids.get(str(abm.message_id))
+        if trace_id:
+            event.set_extra("message_trace_id", trace_id)
+        await emit_message_trace(
+            event,
+            "inbound_normalized",
+            {
+                "message_str": abm.message_str,
+                "message": abm.message,
+                "message_id": abm.message_id,
+                "message_type": str(abm.type),
+                "sender_id": abm.sender.user_id,
+                "sender_name": abm.sender.nickname,
+                "session_id": abm.session_id,
+            },
+        )
+        self.commit_event(event)
 
     async def run(self) -> None:
         # await self.client_.start()
